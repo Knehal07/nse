@@ -1,5 +1,0 @@
-streamlit==1.37.1
-pandas>=2.0.0
-plotly>=5.20.0
-nsepython>=2.7
-streamlit-autorefresh>=0.0.2
