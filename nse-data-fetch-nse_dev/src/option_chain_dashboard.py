@@ -1,4 +1,4 @@
-# === app.py — NSE Option Chain Dashboard + Inline Kite Login (single-file) ===
+# === app.py — NSE Option Chain Dashboard + Inline Kite Login + ML Blend + Accurate NFO Symbol ===
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -7,7 +7,7 @@ from nsepython import nse_optionchain_scrapper
 from streamlit_autorefresh import st_autorefresh
 from datetime import datetime, timezone
 from dataclasses import dataclass
-import json, os
+import json, os, pickle
 from pathlib import Path
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -63,15 +63,25 @@ expiry_date = None
 spot_price = None
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 🪁 Zerodha Kite — inline login + client accessor
+# 🪁 Zerodha Kite — inline login + client accessor (secrets-safe)
 # ──────────────────────────────────────────────────────────────────────────────
 KITE_SESSION_PATH = Path("kite_session.json")
 
 def _load_creds():
-    # Prefer Streamlit Secrets; fallback to env vars
-    api_key = st.secrets.get("KITE_API_KEY", os.getenv("KITE_API_KEY", ""))
-    api_secret = st.secrets.get("KITE_API_SECRET", os.getenv("KITE_API_SECRET", ""))
-    redirect_url = st.secrets.get("KITE_REDIRECT_URL", os.getenv("KITE_REDIRECT_URL", "http://localhost:8501/"))
+    """
+    Safely load Kite creds. Uses environment variables first, then overrides
+    with Streamlit secrets if a secrets.toml exists. Never raises FileNotFoundError.
+    """
+    api_key = os.getenv("KITE_API_KEY", "")
+    api_secret = os.getenv("KITE_API_SECRET", "")
+    redirect_url = os.getenv("KITE_REDIRECT_URL", "http://localhost:8501/")
+    try:
+        s = st.secrets
+        api_key = s.get("KITE_API_KEY", api_key)
+        api_secret = s.get("KITE_API_SECRET", api_secret)
+        redirect_url = s.get("KITE_REDIRECT_URL", redirect_url)
+    except Exception:
+        pass
     return api_key, api_secret, redirect_url
 
 def _save_session(api_key: str, access_token: str):
@@ -139,7 +149,7 @@ with st.sidebar:
             st.rerun()
     else:
         if not api_key or not api_secret:
-            st.error("Add KITE_API_KEY and KITE_API_SECRET in Secrets or env.")
+            st.error("Add KITE_API_KEY and KITE_API_SECRET via env vars or secrets.toml")
         else:
             try:
                 from kiteconnect import KiteConnect
@@ -173,6 +183,77 @@ with st.sidebar:
                             st.rerun()
                         except Exception as e:
                             st.error(f"Token exchange failed: {e}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 🔤 NFO tradingsymbol resolver (weekly/monthly safe) using Kite instruments
+# ──────────────────────────────────────────────────────────────────────────────
+from datetime import datetime as _dt
+
+@st.cache_resource(show_spinner=False)
+def _load_instruments_df():
+    """Load NFO instruments once from Kite. Returns None if not logged in."""
+    kite = get_kite()
+    if not kite:
+        return None
+    try:
+        ins = kite.instruments("NFO")  # list of dicts
+        df = pd.DataFrame(ins)
+        return df
+    except Exception as e:
+        st.sidebar.warning(f"Could not load NFO instruments: {e}")
+        return None
+
+def _parse_nse_expiry_str(s: str) -> _dt:
+    """Parse expiry string from nsepython like '12-Sep-2025'."""
+    for fmt in ("%d-%b-%Y", "%d-%b-%y", "%d-%B-%Y"):
+        try:
+            return _dt.strptime(s, fmt)
+        except Exception:
+            pass
+    try:
+        return pd.to_datetime(s).to_pydatetime()
+    except Exception:
+        raise ValueError(f"Unrecognized expiry format: {s}")
+
+def find_tradingsymbol_from_instruments(symbol: str, expiry_str: str, strike: int | float, opt_type: str) -> str | None:
+    """
+    Return exact tradingsymbol from Kite instruments for the given symbol/expiry/strike/CE|PE.
+    Works for weekly & monthly expiries.
+    """
+    df = _load_instruments_df()
+    if df is None or df.empty:
+        return None
+
+    name = symbol.upper().strip()
+    side = opt_type.upper().strip()
+    try:
+        exp = _parse_nse_expiry_str(expiry_str).date()
+    except Exception:
+        return None
+
+    dff = df.copy()
+    if "segment" in dff.columns:
+        dff = dff[dff["segment"] == "NFO-OPT"]
+    if "exchange" in dff.columns:
+        dff = dff[dff["exchange"] == "NFO"]
+    if "name" in dff.columns:
+        dff = dff[dff["name"].str.upper() == name]
+    if "instrument_type" in dff.columns:
+        dff = dff[dff["instrument_type"].str.upper() == side]
+
+    if "expiry" in dff.columns:
+        dff = dff.dropna(subset=["expiry"])
+        dff = dff[pd.to_datetime(dff["expiry"]).dt.date == exp]
+
+    if "strike" in dff.columns:
+        tol = 1e-6
+        dff = dff[(dff["strike"] - float(strike)).abs() <= tol]
+
+    if dff.empty:
+        return None
+
+    ts = dff.iloc[0].get("tradingsymbol")
+    return str(ts) if pd.notna(ts) else None
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Order preview helper (non-invasive)
@@ -460,6 +541,138 @@ def save_weights_to_disk(w: dict, path=WEIGHTS_PATH):
         return False
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 🧠 ML ADD-ON: dataset, trainer, inference, and UI
+# ──────────────────────────────────────────────────────────────────────────────
+ML_MODEL_PATH = "ml_model.pkl"
+FEATURE_KEYS = [
+    "pcr_now","pcr_ema_mid","pcr_ema_slope","doi_edge","iv_skew",
+    "oi_diff_total","dist_to_maxpain","support_strength","resistance_strength",
+    "doi_edge_pr","pcr_ema_pr","atm"
+]
+
+def build_ml_dataset(snaps: list, window: int = 7, horizon: int = 1):
+    """
+    Build (X,y) from session snapshots.
+    Label y = 1 if spot(t+horizon) > spot(t), else 0.
+    """
+    rows = []
+    for i in range(len(snaps) - horizon):
+        s0, s1 = snaps[i], snaps[i + horizon]
+        df0 = s0["df"].copy()
+        df0["PCR_EMA"] = ema(df0["PCR"], span=window)
+        feats = extract_features(df0, s0.get("spot"), s0.get("mp"), window)
+        if s0.get("spot") is None or s1.get("spot") is None:
+            continue
+        y = 1 if float(s1["spot"]) > float(s0["spot"]) else 0
+        rows.append({**{k: float(feats.get(k, 0.0)) for k in FEATURE_KEYS}, "y": int(y)})
+
+    if not rows:
+        return pd.DataFrame(columns=FEATURE_KEYS), pd.Series(dtype=int)
+
+    X = pd.DataFrame([{k: r[k] for k in FEATURE_KEYS} for r in rows])
+    y = pd.Series([r["y"] for r in rows], name="y").astype(int)
+    return X, y
+
+def train_ml_model(X: pd.DataFrame, y: pd.Series):
+    """
+    Prefer XGBoost; fallback to sklearn GradientBoosting.
+    """
+    if len(X) == 0:
+        raise ValueError("Empty training set.")
+    try:
+        import xgboost as xgb
+        model = xgb.XGBClassifier(
+            n_estimators=250,
+            max_depth=3,
+            learning_rate=0.05,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            reg_lambda=1.0,
+            random_state=42,
+            eval_metric="logloss",
+        )
+    except Exception:
+        from sklearn.ensemble import GradientBoostingClassifier
+        model = GradientBoostingClassifier(random_state=42)
+
+    model.fit(X, y)
+    return model
+
+def save_ml_model(model, path=ML_MODEL_PATH):
+    with open(path, "wb") as f:
+        pickle.dump(model, f)
+
+def load_ml_model(path=ML_MODEL_PATH):
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            return None
+    return None
+
+def predict_ml_prob_up(model, feats: dict) -> float | None:
+    if model is None:
+        return None
+    try:
+        x = pd.DataFrame([{k: float(feats.get(k, 0.0)) for k in FEATURE_KEYS}])
+        proba = getattr(model, "predict_proba", None)
+        if proba is not None:
+            p = proba(x)
+            return float(p[0, 1])
+        decision_function = getattr(model, "decision_function", None)
+        if decision_function is not None:
+            from math import exp
+            z = float(decision_function(x)[0])
+            return 1.0 / (1.0 + exp(-z))
+        return float(model.predict(x)[0])
+    except Exception:
+        return None
+
+# ── Sidebar: ML controls
+with st.sidebar:
+    st.subheader("🧠 ML Model")
+    enable_ml = st.checkbox("Use ML forecast (blend with rules)", value=False)
+    ml_weight = st.slider("Blend weight → ML vs Rule", 0.0, 1.0, 0.50, 0.05,
+                          help="0 = only your rule-based score, 1 = only ML")
+    horizon = st.number_input("Forecast horizon (snapshot steps ahead)", min_value=1, max_value=10, value=1, step=1)
+    min_samples = st.number_input("Min samples to train", min_value=20, max_value=2000, value=80, step=10)
+
+    train_btn = st.button("🧪 Train ML model on session data")
+    if train_btn:
+        X, y = build_ml_dataset(st.session_state.get("snapshots", []), window=window, horizon=int(horizon))
+        if len(X) < int(min_samples):
+            st.warning(f"Not enough samples to train ({len(X)} < {int(min_samples)}). "
+                       "Let the app run longer to collect snapshots.")
+        else:
+            try:
+                model = train_ml_model(X, y)
+                save_ml_model(model)
+                # simple time-aware split metrics
+                split = int(0.8 * len(X))
+                if 1 <= split < len(X):
+                    X_tr, y_tr = X.iloc[:split], y.iloc[:split]
+                    X_te, y_te = X.iloc[split:], y.iloc[split:]
+                    try:
+                        from sklearn.metrics import accuracy_score, roc_auc_score
+                        if hasattr(model, "predict_proba"):
+                            yhatp = model.predict_proba(X_te)[:, 1]
+                            auc = roc_auc_score(y_te, yhatp)
+                        else:
+                            auc = np.nan
+                        acc = accuracy_score(y_te, model.predict(X_te))
+                        st.success(f"Model trained ✅ Samples={len(X)} | Test Acc={acc:.2f} | AUC={auc if not np.isnan(auc) else '—'}")
+                    except Exception:
+                        st.success(f"Model trained ✅ Samples={len(X)}")
+                else:
+                    st.success(f"Model trained ✅ Samples={len(X)}")
+            except Exception as e:
+                st.error(f"Training failed: {e}")
+
+# Load model once per run
+ml_model = load_ml_model()
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Session state for learning & backtesting
 # ──────────────────────────────────────────────────────────────────────────────
 if "sig_weights" not in st.session_state:
@@ -516,15 +729,34 @@ if symbol and expiry_date:
             else: tag=("🟡 Neutral Bias","#fff2b2")
             st.markdown(
                 f"""
-                <div style="background:{tag[0]};padding:12px;border-radius:12px;text-align:center;font-size:18px;font-weight:700">
+                <div style="background:{tag[1]};padding:12px;border-radius:12px;text-align:center;font-size:18px;font-weight:700">
                 {tag[0]} • 📊 Overall PCR: <b>{overall_pcr_safe:.2f}</b> • 🎯 Max Pain: <b>{mp}</b> • 🧮 Bias Score: <b>{score_safe}/100</b>
                 </div>
                 """, unsafe_allow_html=True
             )
 
-            # ---- Signal Engine ----
+            # ---- Feature build
             feats = extract_features(df_oi, spot_price, mp, window)
-            prob_bull = logistic_score(feats, st.session_state.sig_weights)
+
+            # ---- Rule-based probability
+            rule_prob = logistic_score(feats, st.session_state.sig_weights)
+
+            # ---- ML probability (optional)
+            ml_prob = predict_ml_prob_up(ml_model, feats) if enable_ml else None
+
+            # ---- Blend
+            if enable_ml and (ml_prob is not None):
+                prob_bull = (1.0 - ml_weight) * rule_prob + ml_weight * ml_prob
+            else:
+                prob_bull = rule_prob
+
+            # Show a small readout
+            c_prob1, c_prob2, c_prob3 = st.columns(3)
+            with c_prob1: st.metric("Rule prob (bull)", f"{rule_prob:.2f}")
+            with c_prob2: st.metric("ML prob (bull)", "—" if ml_prob is None else f"{ml_prob:.2f}")
+            with c_prob3: st.metric("Blended prob", f"{prob_bull:.2f}")
+
+            # ---- Decide using blended probability
             signal = decide_action(prob_bull, feats, df_oi, spot_price, symbol,
                                    acct_equity, risk_pct, max_expo_pct, lot_size)
 
@@ -537,14 +769,14 @@ if symbol and expiry_date:
             if gated_side in ("CALL","PUT"):
                 if signal.qty and signal.qty>0:
                     st.info(f"➡️ Action: **{gated_side}** {signal.entry_strike}  | Qty **{signal.qty}**  | SL **₹{signal.sl}**  | TP **₹{signal.tp}**")
-                    # ── OPTIONAL: show order preview for the recommended strike
                     if place_order_ready:
-                        # naive example tradingsymbol (adjust to your expiry code scheme):
-                        # e.g., 'NIFTY25SEP24650CE' / 'BANKNIFTY25SEP48000CE'
-                        exp_hint = (expiry_date or "").upper().replace("-", "")[:6]  # very rough
                         cepe = "CE" if gated_side=="CALL" else "PE"
-                        tsym = f"{symbol.upper()}{exp_hint}{int(signal.entry_strike)}{cepe}"
-                        maybe_place_order_ui(gated_side, tsym, signal.qty, signal.sl, signal.tp)
+                        tsym = find_tradingsymbol_from_instruments(symbol, expiry_date, int(signal.entry_strike), cepe)
+                        if tsym:
+                            maybe_place_order_ui(gated_side, tsym, signal.qty, signal.sl, signal.tp)
+                        else:
+                            st.info("⚠️ Could not resolve tradingsymbol from instruments. "
+                                    "Ensure you’re logged into Kite and the instruments dump is available.")
                 else:
                     st.warning("⚠️ Risk/Exposure limits imply 0 lots. Tweak risk %, exposure %, or lot size.")
 
@@ -646,7 +878,9 @@ if symbol and expiry_date:
             styler = styler.apply(highlight_reco_row, axis=1)
 
             # Apply max-highlighting LAST
-            max_cols = ["VOL_CE","CE_OI","CE_dOI","PE_dOI","PE_OI","VOL_PE"]
+            max_cols = ["VOL_CE","CE_OI","CE_dOI","PE_D OI","PE_OI","VOL_PE"]
+            # (typo protection)
+            max_cols = [c.replace("PE_D OI","PE_dOI") for c in max_cols]
             for c in max_cols:
                 if c in tbl.columns:
                     styler = styler.apply(style_max_cells, subset=[c], axis=0)
@@ -677,7 +911,14 @@ if symbol and expiry_date:
                         df0, df1 = s0["df"].copy(), s1["df"].copy()
                         df0["PCR_EMA"] = ema(df0["PCR"], span=window)
                         feats0 = extract_features(df0, s0["spot"], s0["mp"], window)
-                        p0 = logistic_score(feats0, st.session_state.sig_weights)
+
+                        # blended prob in backtest
+                        p_rule = logistic_score(feats0, st.session_state.sig_weights)
+                        p_ml = predict_ml_prob_up(ml_model, feats0) if enable_ml else None
+                        p0 = (1.0 - ml_weight) * p_rule + (ml_weight * p_ml if (enable_ml and p_ml is not None) else 0.0)
+                        if (not enable_ml) or (p_ml is None):
+                            p0 = p_rule
+
                         sig0 = decide_action(p0, feats0, df0, s0["spot"], symbol, acct_equity, risk_pct, max_expo_pct, lot_size)
                         if sig0.side=="WAIT" or sig0.confidence<conf_threshold or sig0.entry_strike is None: continue
                         leg = "LTP_CE" if sig0.side=="CALL" else "LTP_PE"
@@ -685,7 +926,7 @@ if symbol and expiry_date:
                         row1 = df1.iloc[(df1["Strike"]-sig0.entry_strike).abs().argmin()]
                         entry = float(nz(row0.get(leg, np.nan), np.nan)); exitp = float(nz(row1.get(leg, np.nan), np.nan))
                         if any([np.isnan(entry), entry<=0, np.isnan(exitp), exitp<=0]): continue
-                        pnl = round((exitp-entry)* (sig0.qty if sig0.qty else lot_size), 2)
+                        pnl = round((exitp-entry)* (sig0.qty if sig0.qty else lot_size), 2)  # ₹ P&L
                         eq += pnl; total += 1; wins += 1 if pnl>0 else 0
                         trades.append({"in":s0["ts"], "out":s1["ts"], "side":sig0.side, "strike":sig0.entry_strike,
                                        "entry":round(entry,2),"exit":round(exitp,2),"qty":sig0.qty or lot_size,"pnl_₹":pnl,
